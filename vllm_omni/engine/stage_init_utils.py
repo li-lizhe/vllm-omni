@@ -1523,6 +1523,19 @@ def build_vllm_config(
 
         filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
 
+    # _to_dict likewise serializes `fault_tolerance_config`, whose default comes
+    # from a `default_factory`, into a plain dict even when the user never set it.
+    # vLLM's EngineArgs.__post_init__ treats *any* dict-valued
+    # `fault_tolerance_config` as an explicitly passed `--fault-tolerance-config`
+    # and auto-enables fault tolerance (which then fails engine construction
+    # outside external-LB mode).  Reconstruct the dataclass so an untouched
+    # default is not mistaken for an explicit opt-in (issue #8816).
+    ftc = filtered_engine_args_dict.get("fault_tolerance_config")
+    if isinstance(ftc, dict):
+        from vllm.config import FaultToleranceConfig
+
+        filtered_engine_args_dict["fault_tolerance_config"] = FaultToleranceConfig(**ftc)
+
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
 
     # Guard against a per-stage world size that its assigned ``devices`` cannot
