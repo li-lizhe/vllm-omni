@@ -1483,6 +1483,38 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
         raise ValueError(message) from e
 
 
+def restore_serialized_engine_args(engine_args_dict: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild the dataclass fields that ``_to_dict`` serialized into plain dicts.
+
+    Per-stage arguments reach ``OmniEngineArgs`` as a plain dict, so every nested
+    dataclass arrives as a dict.  Two of those fields are consumed before
+    ``create_engine_config()`` gets to them:
+
+    * ``structured_outputs_config`` is assigned to by
+      ``EngineArgs.create_engine_config()``, which fails on a plain dict.
+    * ``fault_tolerance_config`` is read by ``EngineArgs.__post_init__``, which
+      treats *any* dict there as an explicit ``--fault-tolerance-config`` and
+      flips ``enable_fault_tolerance`` on (issue #8816).  A stage that never
+      asked for fault tolerance must not be moved onto that path by a
+      serialization round trip.
+
+    Reconstruct both so the dataclass defaults survive the round trip.
+    """
+    soc = engine_args_dict.get("structured_outputs_config")
+    if isinstance(soc, dict):
+        from vllm.config import StructuredOutputsConfig
+
+        engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
+
+    ftc = engine_args_dict.get("fault_tolerance_config")
+    if isinstance(ftc, dict):
+        from vllm.config import FaultToleranceConfig
+
+        engine_args_dict["fault_tolerance_config"] = FaultToleranceConfig(**ftc)
+
+    return engine_args_dict
+
+
 def build_vllm_config(
     stage_config: Any,
     model: str,
@@ -1512,16 +1544,11 @@ def build_vllm_config(
         filtered_engine_args_dict["_api_process_rank"] = api_process_rank
 
     # _to_dict serializes dataclass fields (e.g. StructuredOutputsConfig) into
-    # plain dicts.  When OmniEngineArgs is instantiated with the dict, these
-    # fields remain dicts instead of being reconstructed as dataclass objects.
-    # Later, EngineArgs.create_engine_config() does
-    #   self.structured_outputs_config.reasoning_parser = ...
-    # which fails on a plain dict.  Reconstruct the dataclass here.
-    soc = filtered_engine_args_dict.get("structured_outputs_config")
-    if isinstance(soc, dict):
-        from vllm.config import StructuredOutputsConfig
-
-        filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
+    # plain dicts, and OmniEngineArgs would keep them as dicts.  Rebuild the ones
+    # that EngineArgs cannot handle: a plain structured_outputs_config breaks
+    # create_engine_config(), and a plain fault_tolerance_config silently enables
+    # fault tolerance for the stage (issue #8816).
+    filtered_engine_args_dict = restore_serialized_engine_args(filtered_engine_args_dict)
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
 
