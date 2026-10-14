@@ -273,13 +273,30 @@ def maybe_load_from_ipc_with_metrics(
     }
 
 
+# Marker attached by ``_to_dict`` when it flattened a typed config.  It travels
+# with the dict so the reconstruction boundary can tell a *serialized* config
+# apart from one the user wrote as a dict: vLLM treats any dict-valued
+# ``fault_tolerance_config`` as an explicit ``--fault-tolerance-config`` and
+# auto-enables fault tolerance, which is the intended behaviour for the latter
+# and a bug for the former (issue #8816).
+FT_CONFIG_WAS_TYPED_KEY = "_omni_ft_config_was_typed"
+
+
 # Convert OmegaConf/objects to plain dicts
 def _to_dict(x: Any) -> dict[str, Any]:
     try:
         if isinstance(x, dict):
             return dict(x)
         if is_dataclass(x) and not isinstance(x, type):
-            return asdict(x)
+            result = asdict(x)
+            # Record provenance before the type is lost.  Comparing the dumped
+            # values against the defaults cannot do this: an explicit config
+            # may legitimately equal the default.
+            from vllm.config import FaultToleranceConfig
+
+            if isinstance(getattr(x, "fault_tolerance_config", None), FaultToleranceConfig):
+                result[FT_CONFIG_WAS_TYPED_KEY] = True
+            return result
         return _omega_to_dict(x)
     except Exception:
         try:

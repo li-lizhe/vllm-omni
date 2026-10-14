@@ -54,7 +54,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
 )
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
+from vllm_omni.entrypoints.stage_utils import FT_CONFIG_WAS_TYPED_KEY, _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer, omni_renderer_cls
@@ -1483,7 +1483,11 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
         raise ValueError(message) from e
 
 
-def restore_serialized_engine_args(engine_args_dict: dict[str, Any]) -> dict[str, Any]:
+def restore_serialized_engine_args(
+    engine_args_dict: dict[str, Any],
+    *,
+    ft_config_was_typed: bool = False,
+) -> dict[str, Any]:
     """Rebuild the dataclass fields that ``_to_dict`` serialized into plain dicts.
 
     Per-stage arguments reach ``OmniEngineArgs`` as a plain dict, so every nested
@@ -1498,19 +1502,25 @@ def restore_serialized_engine_args(engine_args_dict: dict[str, Any]) -> dict[str
       asked for fault tolerance must not be moved onto that path by a
       serialization round trip.
 
-    Reconstruct both so the dataclass defaults survive the round trip.
+    ``fault_tolerance_config`` needs one extra bit that
+    ``structured_outputs_config`` does not: upstream's auto-enable is *intended*
+    for a dict the user wrote, so only a config that carried provenance from
+    ``_to_dict`` — reported here as ``ft_config_was_typed`` — may be rebuilt.
+    Anything else is passed through with its dict intact, keeping upstream's
+    explicit-config semantics (including a config that equals the default).
     """
+    if ft_config_was_typed:
+        ftc = engine_args_dict.get("fault_tolerance_config")
+        if isinstance(ftc, dict):
+            from vllm.config import FaultToleranceConfig
+
+            engine_args_dict["fault_tolerance_config"] = FaultToleranceConfig(**ftc)
+
     soc = engine_args_dict.get("structured_outputs_config")
     if isinstance(soc, dict):
         from vllm.config import StructuredOutputsConfig
 
         engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
-
-    ftc = engine_args_dict.get("fault_tolerance_config")
-    if isinstance(ftc, dict):
-        from vllm.config import FaultToleranceConfig
-
-        engine_args_dict["fault_tolerance_config"] = FaultToleranceConfig(**ftc)
 
     return engine_args_dict
 
@@ -1538,7 +1548,14 @@ def build_vllm_config(
             else build_engine_args_dict(stage_config, model, stage_connector_spec=stage_connector_spec)
         )
 
-    filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+    # A private transport marker set by ``_to_dict`` when it flattened a typed
+    # config; it must not reach the dataclass.  Read it before filtering, which
+    # drops undeclared keys.
+    ft_config_was_typed = engine_args_dict.get(FT_CONFIG_WAS_TYPED_KEY) is True
+    filtered_engine_args_dict = filter_dataclass_kwargs(
+        OmniEngineArgs,
+        {key: value for key, value in engine_args_dict.items() if key != FT_CONFIG_WAS_TYPED_KEY},
+    )
     if api_process_count != 1 or api_process_rank != 0:
         filtered_engine_args_dict["_api_process_count"] = api_process_count
         filtered_engine_args_dict["_api_process_rank"] = api_process_rank
@@ -1546,9 +1563,12 @@ def build_vllm_config(
     # _to_dict serializes dataclass fields (e.g. StructuredOutputsConfig) into
     # plain dicts, and OmniEngineArgs would keep them as dicts.  Rebuild the ones
     # that EngineArgs cannot handle: a plain structured_outputs_config breaks
-    # create_engine_config(), and a plain fault_tolerance_config silently enables
-    # fault tolerance for the stage (issue #8816).
-    filtered_engine_args_dict = restore_serialized_engine_args(filtered_engine_args_dict)
+    # create_engine_config(), and a flattened fault_tolerance_config silently
+    # enables fault tolerance for the stage (issue #8816).
+    filtered_engine_args_dict = restore_serialized_engine_args(
+        filtered_engine_args_dict,
+        ft_config_was_typed=ft_config_was_typed,
+    )
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
 
